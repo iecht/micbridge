@@ -1,33 +1,33 @@
 # MicBridge
 
-用一台 Mac（比如 MacBook Air）的麦克风，给局域网里另一台没有麦克风的 Mac（比如 Mac mini）当音频输入设备。在 Mac mini 上一开始录音，就会自动调用 Air 的麦克风。
+English | [简体中文](README.zh-CN.md)
 
-*Use one Mac's microphone as the audio input of another Mac on the same LAN — turned on automatically whenever an app starts recording.*
+Use one Mac's microphone (say, a MacBook Air) as the audio input of another Mac on the same LAN that has none (say, a Mac mini). As soon as an app on the Mac mini starts recording, the MacBook's microphone switches on automatically.
 
-## 工作原理
+## How it works
 
 ```
-Mac mini 上某个 App 开始从 BlackHole 录音
-  → Receiver 检测到（Core Audio 按进程的录音状态）
-  → 通过常驻的 TCP 连接通知 Air 打开麦克风
-  → Air 上的 Sender 推送 16-bit PCM 音频
-  → Receiver 把音频写进 BlackHole → App 录到的就是 Air 麦克风的声音
-App 停止录音 3 秒后 → 通知 Air 关闭麦克风（橙色指示灯熄灭）
+An app on the Mac mini starts recording from BlackHole
+  → Receiver notices (Core Audio per-process recording state)
+  → tells the MacBook over a persistent TCP connection to switch its mic on
+  → Sender on the MacBook streams 16-bit PCM audio
+  → Receiver plays it into BlackHole → the app hears the MacBook's mic
+3 s after the app stops recording → Receiver tells the MacBook to switch the mic off (the orange indicator goes out)
 ```
 
-- 两台 Mac 通过 Bonjour 自动发现对方，不用填 IP。
-- 连接常驻，开始录音后通常 0.4–1 秒就能收到声音。
-- 不录音时 Air 的麦克风是关闭的。
+- The two Macs find each other via Bonjour; no IP addresses to configure.
+- The connection stays up, so audio usually arrives 0.4–1 s after recording starts.
+- The MacBook's microphone is off whenever nothing is recording.
 
-## 要求
+## Requirements
 
-- 两台 Mac 都是 macOS 14.2 或更新版本，并且在同一个局域网里。
-- 安装了 Xcode Command Line Tools（`xcode-select --install`），用来编译。
-- 接收端（没有麦克风的那台）需要安装虚拟声卡 [BlackHole](https://existential.audio/blackhole/)。
+- Both Macs on macOS 14.2 or later, on the same local network.
+- Xcode Command Line Tools (`xcode-select --install`) for building.
+- On the receiving Mac (the one without a mic): the [BlackHole](https://existential.audio/blackhole/) virtual audio driver.
 
-## 安装
+## Install
 
-**接收端（Mac mini）**
+**Receiver (Mac mini)**
 
 ```bash
 brew install --cask blackhole-2ch
@@ -35,47 +35,47 @@ git clone https://github.com/iecht/micbridge.git && cd micbridge
 ./install.sh receiver
 ```
 
-- 会把 BlackHole 2ch 设为系统默认输入设备。如果安装后看不到 BlackHole，运行 `sudo killall coreaudiod` 重启音频服务。
-- 如果 Bonjour 找不到发送端，可以直接指定 IP：`./install.sh receiver --host 192.168.x.x`
-- 也可以改用其他虚拟设备，比如 Rogue Amoeba Loopback：`./install.sh receiver --device "Loopback Audio"`
+- This makes BlackHole 2ch the system's default input device. If BlackHole doesn't show up after installing, restart the audio service with `sudo killall coreaudiod`.
+- If Bonjour can't find the sender, give its address directly: `./install.sh receiver --host 192.168.x.x`
+- You can feed a different virtual device instead, e.g. Rogue Amoeba Loopback: `./install.sh receiver --device "Loopback Audio"`
 
-**发送端（MacBook Air）**
+**Sender (MacBook Air)**
 
 ```bash
 git clone https://github.com/iecht/micbridge.git && cd micbridge
 ./install.sh sender
 ```
 
-第一次运行时会弹出 **麦克风** 和 **本地网络** 两个权限请求，都要点「允许」。
+On first run macOS asks for **Microphone** and **Local Network** access; allow both.
 
-两端都会作为登录项在后台运行，开机自动启动，崩溃了会自动重启。卸载：在对应的机器上运行 `./install.sh uninstall`。
+Both sides run in the background as login items: they start at login and restart if they crash. To remove either one, run `./install.sh uninstall` on that Mac.
 
-## 使用
+## Usage
 
-在 Mac mini 上打开任何需要麦克风的 App（会议、听写、录音软件），把输入设备选为 **BlackHole 2ch**（默认已经是了），直接开始用就行。
+On the Mac mini, open any app that needs a microphone (video calls, dictation, recording software), choose **BlackHole 2ch** as the input (it's already the default), and start talking.
 
-## 接收端参数
+## Receiver options
 
-| 参数 | 作用 |
+| Option | Effect |
 |---|---|
-| `--host IP` | 不用 Bonjour，直接连接这个地址 |
-| `--port N` | 端口（默认 50555，两端要一致） |
-| `--device NAME` | 写入哪个虚拟设备（默认 BlackHole） |
-| `--always-on` | 让发送端的麦克风一直开着，开始录音时零等待 |
-| `--no-set-default` | 不修改系统默认输入设备 |
+| `--host IP` | Connect to this address instead of using Bonjour |
+| `--port N` | Port (default 50555; must match on both sides) |
+| `--device NAME` | Virtual device to feed (default: BlackHole) |
+| `--always-on` | Keep the sender's mic on all the time, for zero startup delay |
+| `--no-set-default` | Don't change the system's default input device |
 
-## 日志
+## Logs
 
-- 发送端：`~/Library/Logs/micbridge-sender.log`
-- 接收端：`~/Library/Logs/micbridge-receiver.log`
+- Sender: `~/Library/Logs/micbridge-sender.log`
+- Receiver: `~/Library/Logs/micbridge-receiver.log`
 
-## 已知限制
+## Known limitations
 
-- MacBook **合上盖子时麦克风会被硬件禁用**，睡眠时也连不上。用的时候要开着盖子、保持唤醒（推流期间程序会阻止 Air 自动睡眠）。
-- 连接是常驻的，App 开始录音后只需等发送端的麦克风启动（通常 0.4–1 秒）。想完全零等待可以用 `--always-on`，但发送端的麦克风指示灯会一直亮着。
-- 端到端延迟大约 50–150 ms，适合语音、会议、听写，不适合实时监听乐器演奏。
-- 音频在局域网里不加密传输。
+- A MacBook's microphone is **disabled in hardware while the lid is closed**, and a sleeping MacBook can't be reached. Keep the lid open and the machine awake (the sender prevents idle sleep while streaming).
+- Because the connection is persistent, a recording only waits for the sender's microphone to start (typically 0.4–1 s). For no wait at all use `--always-on`, at the cost of the mic indicator staying lit.
+- End-to-end latency is roughly 50–150 ms: fine for speech, calls and dictation, not for live instrument monitoring.
+- Audio travels over the LAN unencrypted.
 
-## 许可
+## License
 
 MIT
