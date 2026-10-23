@@ -5,7 +5,7 @@
 // audio into BlackHole, so the app hears the Air's mic. When recording stops, it
 // asks the Air to switch the microphone off again.
 
-import AVFoundation
+import AudioToolbox
 import CoreAudio
 import Foundation
 import Network
@@ -150,6 +150,72 @@ final class RingBuffer {
     }
 }
 
+// MARK: - Output to the virtual device
+
+/// Plays the ring buffer into one specific device through its own HAL output unit.
+/// Unlike AVAudioEngine's output node, this stays on that device when the user
+/// changes the system's default output (e.g. back to the speakers).
+final class DeviceOutput {
+    private var unit: AudioUnit
+    private let ring: RingBuffer
+
+    struct Failure: Error, CustomStringConvertible {
+        let step: String, status: OSStatus
+        var description: String { "\(step) failed (\(status))" }
+    }
+
+    init(device: AudioDeviceID, sampleRate: Double, ring: RingBuffer) throws {
+        self.ring = ring
+        var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
+                                             componentSubType: kAudioUnitSubType_HALOutput,
+                                             componentManufacturer: kAudioUnitManufacturer_Apple,
+                                             componentFlags: 0, componentFlagsMask: 0)
+        guard let comp = AudioComponentFindNext(nil, &desc) else { throw Failure(step: "find HAL output", status: -1) }
+        var u: AudioUnit?
+        try Self.check("create output unit", AudioComponentInstanceNew(comp, &u))
+        unit = u!
+
+        var dev = device
+        try Self.check("select device", AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0, &dev, UInt32(MemoryLayout<AudioDeviceID>.size)))
+
+        // Stereo, so apps recording either channel of BlackHole hear the mic.
+        var fmt = AudioStreamBasicDescription(
+            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 2,
+            mBitsPerChannel: 32, mReserved: 0)
+        try Self.check("set format", AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 0, &fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
+
+        var cb = AURenderCallbackStruct(inputProc: { refCon, _, _, _, frames, abl in
+            let ring = Unmanaged<RingBuffer>.fromOpaque(refCon).takeUnretainedValue()
+            let buffers = UnsafeMutableAudioBufferListPointer(abl!)
+            guard let first = buffers.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            ring.read(into: first, frames: Int(frames))
+            for b in buffers.dropFirst() {
+                b.mData?.copyMemory(from: first, byteCount: Int(frames) * 4)
+            }
+            return noErr
+        }, inputProcRefCon: Unmanaged.passUnretained(ring).toOpaque())
+        try Self.check("set render callback", AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
+            kAudioUnitScope_Input, 0, &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)))
+
+        try Self.check("initialize", AudioUnitInitialize(unit))
+        try Self.check("start", AudioOutputUnitStart(unit))
+    }
+
+    func stop() {
+        AudioOutputUnitStop(unit)
+        AudioUnitUninitialize(unit)
+        AudioComponentInstanceDispose(unit)
+    }
+
+    private static func check(_ step: String, _ status: OSStatus) throws {
+        if status != noErr { throw Failure(step: step, status: status) }
+    }
+}
+
 // MARK: - Receiver
 
 final class Receiver {
@@ -160,8 +226,8 @@ final class Receiver {
     private var conn: NWConnection?
     private var ready = false
     private var micRequested = false
-    private var engine: AVAudioEngine?
-    private var engineRate: Double = 0
+    private var output: DeviceOutput?
+    private var outputRate: Double = 0
     private var ring: RingBuffer?
     private var pending = Data()
     private var idleSince: Date?
@@ -259,9 +325,9 @@ final class Receiver {
         ready = false
         micRequested = false
         idleSince = nil
-        engine?.stop()
-        engine = nil
-        engineRate = 0
+        output?.stop()
+        output = nil
+        outputRate = 0
         ring = nil
         log("disconnected from sender")
     }
@@ -316,33 +382,18 @@ final class Receiver {
     }
 
     private func ensurePlayback(sampleRate: Double) {
-        if engine != nil && engineRate == sampleRate { return }
-        engine?.stop()
+        if output != nil && outputRate == sampleRate { return }
+        output?.stop()
+        output = nil
         let ring = RingBuffer(sampleRate: sampleRate)
         self.ring = ring
-        let engine = AVAudioEngine()
-        var dev = device
-        AudioUnitSetProperty(engine.outputNode.audioUnit!, kAudioOutputUnitProperty_CurrentDevice,
-                             kAudioUnitScope_Global, 0, &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
-        let source = AVAudioSourceNode(format: format) { _, _, frames, abl -> OSStatus in
-            let buffers = UnsafeMutableAudioBufferListPointer(abl)
-            for b in buffers {
-                ring.read(into: b.mData!.assumingMemoryBound(to: Float.self), frames: Int(frames))
-            }
-            return noErr
-        }
-        engine.attach(source)
-        engine.connect(source, to: engine.mainMixerNode, format: format)
         do {
-            try engine.start()
-            self.engine = engine
-            engineRate = sampleRate
+            output = try DeviceOutput(device: device, sampleRate: sampleRate, ring: ring)
+            outputRate = sampleRate
             log("audio output ready → \(deviceName(device)) (\(Int(sampleRate)) Hz)")
         } catch {
             log("could not start audio output: \(error)")
-            self.engine = nil
-            engineRate = 0
+            outputRate = 0
         }
     }
 }
