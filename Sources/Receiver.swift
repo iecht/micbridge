@@ -232,6 +232,7 @@ final class Receiver {
     private var pending = Data()
     private var idleSince: Date?
     private var lastAttempt: Date?
+    private var failures = 0  // consecutive failed attempts, for backoff and quieter logs
     private var requestedAt: Date?
 
     init(device: AudioDeviceID) { self.device = device }
@@ -247,6 +248,11 @@ final class Receiver {
                 if ep != self.senderEndpoint {
                     self.senderEndpoint = ep
                     log(ep.map { "found sender: \($0)" } ?? "sender went away")
+                    // An attempt still pending from before the sender went away (e.g. it
+                    // fell asleep mid-connect) will never finish; start over.
+                    if ep != nil && self.conn != nil && !self.ready { self.disconnect() }
+                    // It just (re)appeared, so try right away instead of waiting out the backoff.
+                    if ep != nil { self.lastAttempt = nil; self.failures = 0 }
                 }
             }
             b.start(queue: queue)
@@ -261,6 +267,11 @@ final class Receiver {
     private var _timer: DispatchSourceTimer?
 
     private func tick() {
+        if conn != nil && !ready, let t = lastAttempt, Date().timeIntervalSince(t) > 8 {
+            failures += 1
+            if failures == 1 { log("connection attempt timed out — retrying in the background") }
+            disconnect()
+        }
         if conn == nil { connect() }
         let wanted = alwaysOn || someoneIsRecording(from: device)
         if wanted {
@@ -291,7 +302,9 @@ final class Receiver {
     // Air's microphone to switch on, not for discovery, TCP setup and audio engine start.
     private func connect() {
         guard let ep = senderEndpoint else { return }
-        if let t = lastAttempt, Date().timeIntervalSince(t) < 2 { return }
+        // Retry every 2 s at first, backing off to every 30 s while the sender stays unreachable.
+        let delay = min(30, 2 * pow(2, Double(min(failures, 4))))
+        if let t = lastAttempt, Date().timeIntervalSince(t) < delay { return }
         lastAttempt = Date()
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
@@ -299,6 +312,7 @@ final class Receiver {
         tcp.keepaliveIdle = 10
         tcp.keepaliveInterval = 5
         tcp.keepaliveCount = 2
+        tcp.connectionTimeout = 5
         let c = NWConnection(to: ep, using: NWParameters(tls: nil, tcp: tcp))
         conn = c
         c.stateUpdateHandler = { [weak self] state in
@@ -307,11 +321,15 @@ final class Receiver {
             case .ready:
                 log("connected to \(ep)")
                 self.ready = true
+                self.failures = 0
                 self.pending = Data()
                 self.ensurePlayback(sampleRate: 48000)  // warm up; rebuilt if the Air uses another rate
                 self.receive(c)
             case .failed(let e), .waiting(let e):
-                log("connection problem: \(e)")
+                self.failures += 1
+                if self.failures == 1 || self.failures % 20 == 0 {
+                    log("cannot reach sender (\(e)) — retrying in the background")
+                }
                 self.disconnect()
             default: break
             }
@@ -320,6 +338,7 @@ final class Receiver {
     }
 
     private func disconnect() {
+        let wasReady = ready
         conn?.cancel()
         conn = nil
         ready = false
@@ -329,7 +348,7 @@ final class Receiver {
         output = nil
         outputRate = 0
         ring = nil
-        log("disconnected from sender")
+        if wasReady { log("disconnected from sender") }
     }
 
     private func receive(_ c: NWConnection) {
